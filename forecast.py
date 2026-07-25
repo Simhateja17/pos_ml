@@ -1,0 +1,77 @@
+"""StatsForecast demand models and held-out evaluation for ML-02."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pandas as pd
+from statsforecast import StatsForecast
+from statsforecast.models import AutoARIMA, AutoETS, SeasonalNaive
+
+
+SEASON_LENGTH = 7
+HOLDOUT_DAYS = 14
+
+
+@dataclass(frozen=True)
+class ForecastResult:
+    model: str
+    demand: float
+    lower: float
+    upper: float
+    wape: float
+    heuristic_wape: float
+
+
+def daily_series(rows: pd.DataFrame, stockout_dates: set[pd.Timestamp]) -> pd.DataFrame:
+    """Create one complete daily series and impute only ledger-proven stockouts."""
+    frame = rows.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame["net_units"] = (frame["units_sold"] - frame["returns_units"]).clip(lower=0)
+    all_dates = pd.date_range(frame["date"].min(), frame["date"].max(), freq="D")
+    result = frame.set_index("date").reindex(all_dates).rename_axis("ds").reset_index()
+    result["unique_id"] = str(frame["variant_id"].iloc[0])
+    result["y"] = result["net_units"].fillna(0.0)
+
+    # A true stockout zero is censored demand. Estimate it from the same weekday
+    # in observed weeks; use the observed mean only when that weekday is absent.
+    observed = result.loc[~result["ds"].isin(stockout_dates), ["ds", "y"]].copy()
+    observed["weekday"] = observed["ds"].dt.dayofweek
+    weekday_mean = observed.groupby("weekday")["y"].mean()
+    fallback = float(observed["y"].mean()) if not observed.empty else 0.0
+    mask = result["ds"].isin(stockout_dates)
+    result.loc[mask, "y"] = result.loc[mask, "ds"].dt.dayofweek.map(weekday_mean).fillna(fallback)
+    return result[["unique_id", "ds", "y"]]
+
+
+def _forecast(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    models = [
+        AutoETS(season_length=SEASON_LENGTH, alias="AutoETS"),
+        AutoARIMA(season_length=SEASON_LENGTH, alias="AutoARIMA"),
+        SeasonalNaive(season_length=SEASON_LENGTH, alias="SeasonalNaive"),
+    ]
+    return StatsForecast(models=models, freq="D", n_jobs=1).forecast(horizon, train, level=[80])
+
+
+def evaluate_and_forecast(series: pd.DataFrame, horizon: int) -> ForecastResult:
+    """Select a model only when it beats the Phase 5 velocity baseline on WAPE."""
+    if len(series) <= HOLDOUT_DAYS:
+        raise ValueError("Series is too short for a held-out evaluation")
+    train = series.iloc[:-HOLDOUT_DAYS]
+    actual = series.iloc[-HOLDOUT_DAYS:]["y"].to_numpy(float)
+    held = _forecast(train, HOLDOUT_DAYS)
+    denominator = max(float(actual.sum()), 1.0)
+    heuristic = float(train["y"].mean())
+    heuristic_wape = float(abs(actual - heuristic).sum() / denominator)
+    candidate_columns = ["AutoETS", "AutoARIMA", "SeasonalNaive"]
+    scores = {name: float(abs(actual - held[name].to_numpy(float)).sum() / denominator) for name in candidate_columns}
+    model, wape = min(scores.items(), key=lambda item: item[1])
+    if wape >= heuristic_wape:
+        raise ValueError(f"forecast does not beat heuristic: WAPE {wape:.3f} >= {heuristic_wape:.3f}")
+
+    future = _forecast(series, horizon)
+    demand = max(0.0, float(future[model].sum()))
+    lower_column, upper_column = f"{model}-lo-80", f"{model}-hi-80"
+    lower = max(0.0, float(future[lower_column].sum()))
+    upper = max(demand, float(future[upper_column].sum()))
+    return ForecastResult(model=model, demand=demand, lower=lower, upper=upper, wape=wape, heuristic_wape=heuristic_wape)
