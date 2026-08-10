@@ -1,4 +1,9 @@
-"""Idempotent forecast write-back; the UI consumes the existing reason contract."""
+"""Idempotent forecast write-back; the UI consumes the existing reason contract.
+
+Phase 8: a suggestion belongs to one SHOP. The database function resolves that
+shop's stock and that shop's inbound orders, so store_id is required rather
+than optional — a forecast written against the wrong shelf is worse than none.
+"""
 from __future__ import annotations
 import json
 from math import ceil
@@ -9,7 +14,7 @@ def confidence(result: ForecastResult) -> str:
     width = (result.upper - result.lower) / max(result.demand, 1)
     return "high" if width <= .35 else "medium" if width <= .8 else "low"
 
-def upsert(connection: psycopg.Connection, tenant_id: str, variant_id: str, result: ForecastResult, context: dict) -> None:
+def upsert(connection: psycopg.Connection, tenant_id: str, store_id: str, variant_id: str, result: ForecastResult, context: dict) -> None:
     safety = max(0, ceil(result.upper - result.demand))
     raw = result.demand + safety - context["currentStock"] - context["onOrder"]
     quantity = max(1, ceil(raw))
@@ -18,10 +23,5 @@ def upsert(connection: psycopg.Connection, tenant_id: str, variant_id: str, resu
               "forecastWape": result.wape, "heuristicWape": result.heuristic_wape,
               "safetyStock": safety, "rawSuggestion": raw}
     with connection.cursor() as cur:
-        cur.execute("""insert into public.reorder_suggestions
-          (tenant_id,variant_id,supplier_id,suggested_quantity,reason,method,confidence,generated_at)
-          values (%s,%s,%s,%s,%s::jsonb,'forecast',%s,now())
-          on conflict (tenant_id,variant_id,((generated_at at time zone 'UTC')::date)) do update
-          set suggested_quantity=excluded.suggested_quantity, reason=excluded.reason,
-              method='forecast', confidence=excluded.confidence, generated_at=excluded.generated_at""",
-          (tenant_id,variant_id,context.get("supplierId"),quantity,json.dumps(reason),confidence(result)))
+        cur.execute("select public.ml_write_forecast_suggestion(%s::uuid,%s::uuid,%s::uuid,%s::numeric,%s::numeric,%s::numeric,%s::text,%s::numeric,%s::numeric,%s::integer,%s::integer,%s::integer,%s::integer,%s::integer,%s::numeric)",
+          (tenant_id,store_id,variant_id,result.demand,result.lower,result.upper,result.model,result.wape,result.heuristic_wape,context['historyDays'],context['windowDays'],context['unitsSoldInWindow'],context['returnsInWindow'],context['netUnitsInWindow'],context['dailyVelocity']))

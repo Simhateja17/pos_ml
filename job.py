@@ -19,6 +19,9 @@ import pandas as pd
 import psycopg
 import statsforecast
 from psycopg.rows import dict_row
+from eligibility import assess
+from forecast import daily_series, evaluate_and_forecast
+from writeback import upsert
 
 
 ALLOWED_TABLE_PRIVILEGES: Final[dict[str, frozenset[str]]] = {
@@ -118,7 +121,36 @@ def inspect_rollup(settings: Settings) -> dict[str, object]:
 
 def main() -> int:
     try:
-        summary = inspect_rollup(Settings.from_environment())
+        settings = Settings.from_environment()
+        summary = inspect_rollup(settings)
+        with psycopg.connect(settings.database_url) as connection, connection.transaction():
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute("select set_config('app.tenant_id', %s, true)", (str(settings.tenant_id),))
+                # Phase 8: the rollup is keyed (tenant, STORE, variant, date). Grouping
+                # by variant alone yields one row per store per date, and
+                # daily_series() reindexes on date — duplicate dates raise. The
+                # job would crash outright for any business with two shops.
+                #
+                # Grouping per (store, variant) is also the correct MODEL: a shop
+                # forecasts its own shelf. Andheri's demand curve is not Bandra's,
+                # and averaging them produces a number that fits neither.
+                cursor.execute("select store_id,variant_id,date,units_sold,returns_units from public.daily_sales_rollup order by store_id,variant_id,date")
+                rows = pd.DataFrame(cursor.fetchall())
+                written = 0
+                if rows.empty:
+                    summary['forecast_rows_written'] = 0
+                    print(json.dumps(summary, default=str, sort_keys=True))
+                    return 0
+                for (store_id, variant_id), group in rows.groupby(['store_id', 'variant_id']):
+                    history = len(group); trailing = int((group.tail(14).units_sold-group.tail(14).returns_units).clip(lower=0).sum()); total = int((group.units_sold-group.returns_units).clip(lower=0).sum())
+                    if not assess(history,trailing,total).eligible: continue
+                    cursor.execute('select stockout_date from public.ml_stockout_dates(%s,%s,%s,%s,%s)',(str(settings.tenant_id),str(store_id),str(variant_id),group.date.min(),group.date.max()))
+                    stockouts={pd.Timestamp(r['stockout_date']) for r in cursor.fetchall()}
+                    try: result=evaluate_and_forecast(daily_series(group,stockouts),14)
+                    except ValueError: continue
+                    context={'supplierId':None,'currentStock':0,'onOrder':0,'windowDays':30,'historyDays':history,'unitsSoldInWindow':int(group.tail(30).units_sold.sum()),'returnsInWindow':int(group.tail(30).returns_units.sum()),'netUnitsInWindow':int((group.tail(30).units_sold-group.tail(30).returns_units).sum()),'dailyVelocity':float(group.tail(30).units_sold.mean()),'leadTimeDays':0,'leadTimeDemand':0,'safetyDays':0,'safetyStock':0,'reorderPoint':0,'reviewPeriodDays':0,'reviewPeriodDemand':0,'supplierName':None}
+                    upsert(connection,str(settings.tenant_id),str(store_id),str(variant_id),result,context); written+=1
+                summary['forecast_rows_written']=written
     except (ValueError, PermissionError, psycopg.Error) as error:
         print(f"forecast job preflight failed: {error}", file=sys.stderr)
         return 1
