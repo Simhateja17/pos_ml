@@ -1,0 +1,47 @@
+name: Deploy ML job to GCP VMs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for GCP Workload Identity Federation — no stored key
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - region: india
+            instance: ambel-india-backend
+            zone: asia-south1-c
+          - region: international
+            instance: instance-20260821-044801
+            zone: us-central1-c
+    env:
+      GCP_PROJECT: refreshing-oven-489212-j9
+    steps:
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Pull latest ML code and reinstall (${{ matrix.region }})
+        run: |
+          gcloud compute ssh "${{ matrix.instance }}" \
+            --zone="${{ matrix.zone }}" \
+            --project="$GCP_PROJECT" \
+            --tunnel-through-iap \
+            --command='
+              set -euo pipefail
+              cd "$HOME/Ambel_pos/ml"
+              git pull --ff-only origin main
+              .venv/bin/pip install --quiet --upgrade pip
+              .venv/bin/pip install --quiet -e .
+            '
