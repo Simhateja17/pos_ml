@@ -37,7 +37,51 @@ jobs:
           cat > remote-deploy.sh <<'REMOTE'
           set -euo pipefail
           cd "$HOME/Ambel_pos/ml"
+          env_backup="$(mktemp -d)"
+          chmod 700 "$env_backup"
+          for env_file in .env .env.*; do
+            [[ -f "$env_file" && "$env_file" != ".env.example" ]] || continue
+            cp -p "$env_file" "$env_backup/"
+          done
+          if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+            git stash push --include-untracked \
+              -m "pre-ml-ci-deploy-$(date -u +%Y%m%dT%H%M%SZ)"
+          fi
           git pull --ff-only origin main
+          for env_file in "$env_backup"/.env "$env_backup"/.env.*; do
+            [[ -f "$env_file" ]] || continue
+            cp -p "$env_file" .
+          done
+          rm -r "$env_backup"
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+          from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+          env_path = Path('.env')
+          lines = env_path.read_text().splitlines()
+          updated = []
+          found = False
+          for line in lines:
+              if not line.startswith('ML_DATABASE_URL='):
+                  updated.append(line)
+                  continue
+              found = True
+              raw = line.split('=', 1)[1].strip()
+              quote = raw[0] if len(raw) >= 2 and raw[0] in "'\"" and raw[-1] == raw[0] else ''
+              value = raw[1:-1] if quote else raw
+              parsed = urlsplit(value)
+              if not parsed.hostname or not parsed.hostname.endswith('.pooler.supabase.com'):
+                  raise SystemExit('ML_DATABASE_URL must use a generated Supabase pooler hostname')
+              if parsed.port not in (5432, 6543):
+                  raise SystemExit('ML_DATABASE_URL must use Supavisor session port 5432')
+              netloc = parsed.netloc.rsplit(':', 1)[0] + ':5432'
+              query = urlencode([(key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True) if key != 'pgbouncer'])
+              session_url = urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+              updated.append(f'ML_DATABASE_URL={quote}{session_url}{quote}')
+          if not found:
+              raise SystemExit('ML_DATABASE_URL is missing from ml/.env')
+          env_path.write_text('\n'.join(updated) + '\n')
+          PY
           .venv/bin/pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -e .
           REMOTE
