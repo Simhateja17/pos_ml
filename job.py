@@ -20,7 +20,7 @@ import psycopg
 import statsforecast
 from psycopg.rows import dict_row
 from eligibility import assess
-from forecast import daily_series, evaluate_and_forecast_profile
+from forecast import calendar_metrics, daily_series, evaluate_and_forecast_profile
 from writeback import upsert
 
 
@@ -152,11 +152,11 @@ def main() -> int:
                     summary['forecast_rows_written'] = 0
                     print(json.dumps(summary, default=str, sort_keys=True))
                     return 0
+                as_of_date = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
                 for (store_id, variant_id), group in rows.groupby(['store_id', 'variant_id']):
-                    history = len(group)
-                    recent = group.tail(30)
-                    trailing = int((group.tail(14).units_sold - group.tail(14).returns_units).clip(lower=0).sum())
-                    total = int((group.units_sold - group.returns_units).clip(lower=0).sum())
+                    history, trailing_float, total_float = calendar_metrics(group, as_of_date)
+                    trailing = int(trailing_float)
+                    total = int(total_float)
                     if not assess(history, trailing, total).eligible:
                         continue
                     cursor.execute(
@@ -173,12 +173,14 @@ def main() -> int:
                     stockouts = {pd.Timestamp(r['stockout_date']) for r in cursor.fetchall()}
                     try:
                         result = evaluate_and_forecast_profile(
-                            daily_series(group, stockouts),
+                            daily_series(group, stockouts, end_date=as_of_date),
                             int(db_context['lead_time_days'] or 7),
                             7,
                         )
                     except ValueError:
                         continue
+                    dates = pd.to_datetime(group["date"])
+                    recent = group.loc[dates >= as_of_date - pd.Timedelta(days=29)]
                     recent_net = (recent.units_sold - recent.returns_units).clip(lower=0)
                     effective_days = max(1, min(history, 30))
                     context = {

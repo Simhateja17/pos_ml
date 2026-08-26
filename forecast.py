@@ -27,12 +27,20 @@ class ForecastResult:
     horizon_days: int = 14
 
 
-def daily_series(rows: pd.DataFrame, stockout_dates: set[pd.Timestamp]) -> pd.DataFrame:
+def daily_series(
+    rows: pd.DataFrame,
+    stockout_dates: set[pd.Timestamp],
+    end_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     """Create one complete daily series and impute only ledger-proven stockouts."""
     frame = rows.copy()
     frame["date"] = pd.to_datetime(frame["date"])
     frame["net_units"] = (frame["units_sold"] - frame["returns_units"]).clip(lower=0)
-    all_dates = pd.date_range(frame["date"].min(), frame["date"].max(), freq="D")
+    observed_end = frame["date"].max()
+    requested_end = pd.Timestamp(end_date) if end_date is not None else observed_end
+    if requested_end.tzinfo is not None:
+        requested_end = requested_end.tz_localize(None)
+    all_dates = pd.date_range(frame["date"].min(), max(observed_end, requested_end), freq="D")
     result = frame.set_index("date").reindex(all_dates).rename_axis("ds").reset_index()
     result["unique_id"] = str(frame["variant_id"].iloc[0])
     result["y"] = result["net_units"].fillna(0.0)
@@ -46,6 +54,29 @@ def daily_series(rows: pd.DataFrame, stockout_dates: set[pd.Timestamp]) -> pd.Da
     mask = result["ds"].isin(stockout_dates)
     result.loc[mask, "y"] = result.loc[mask, "ds"].dt.dayofweek.map(weekday_mean).fillna(fallback)
     return result[["unique_id", "ds", "y"]]
+
+
+def calendar_metrics(
+    rows: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+) -> tuple[int, float, float]:
+    """Return history span, recent net units, and total net units.
+
+    ``daily_sales_rollup`` is sparse: it stores activity days only. The
+    eligibility thresholds are calendar-based, so source-row counts would
+    reject mature intermittent products and an active-row tail would not be a
+    true recent-calendar window.
+    """
+
+    frame = rows.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    observed_start = frame["date"].min()
+    observed_end = frame["date"].max()
+    series = daily_series(frame, set(), end_date=as_of_date)
+    history_days = int((observed_end - observed_start).days) + 1
+    trailing_units = float(series.tail(14)["y"].sum())
+    total_units = float(series["y"].sum())
+    return history_days, trailing_units, total_units
 
 
 def _forecast(train: pd.DataFrame, horizon: int) -> pd.DataFrame:

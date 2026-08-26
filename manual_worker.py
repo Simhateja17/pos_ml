@@ -21,7 +21,7 @@ import statsforecast
 from psycopg.rows import dict_row
 
 from eligibility import assess
-from forecast import daily_series, evaluate_and_forecast_profile
+from forecast import calendar_metrics, daily_series, evaluate_and_forecast_profile
 from job import _connect, _psycopg_url
 
 
@@ -110,11 +110,21 @@ def _stockout_dates(
             return {pd.Timestamp(row["stockout_date"]) for row in cursor.fetchall()}
 
 
-def _heuristic(group: pd.DataFrame, context: dict[str, Any]) -> dict[str, Any]:
+def _heuristic(
+    group: pd.DataFrame,
+    context: dict[str, Any],
+    as_of_date: pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    dates = pd.to_datetime(group["date"])
+    observed_start = dates.min()
+    observed_end = dates.max()
+    end_date = pd.Timestamp(as_of_date) if as_of_date is not None else observed_end
+    if end_date.tzinfo is not None:
+        end_date = end_date.tz_localize(None)
+    recent = group.loc[dates >= end_date - pd.Timedelta(days=WINDOW_DAYS - 1)]
     net = (group["units_sold"] - group["returns_units"]).clip(lower=0)
-    recent = group.tail(WINDOW_DAYS)
     recent_net = (recent["units_sold"] - recent["returns_units"]).clip(lower=0)
-    history_days = int(len(group))
+    history_days = int((observed_end - observed_start).days) + 1
     units = float(recent["units_sold"].sum())
     returns = float(recent["returns_units"].sum())
     net_units = float(recent_net.sum())
@@ -290,9 +300,14 @@ def _heartbeat(connection: psycopg.Connection, tenant_id: str, run_id: str) -> N
             )
 
 
+def _eligibility_metrics(group: pd.DataFrame, as_of_date: Any) -> tuple[int, float, float]:
+    return calendar_metrics(group, pd.Timestamp(as_of_date))
+
+
 def execute_run(connection: psycopg.Connection, tenant_id: str, run: dict[str, Any]) -> dict[str, int]:
     run_id = str(run["run_id"])
     store_id = str(run["store_id"])
+    as_of_date = pd.Timestamp(run["requested_at"]).normalize()
     rows = _rollup(connection, tenant_id, store_id)
     contexts = _context(connection, tenant_id, run_id)
     context_by_variant = {str(row["variant_id"]): row for row in contexts}
@@ -304,10 +319,8 @@ def execute_run(connection: psycopg.Connection, tenant_id: str, run: dict[str, A
         if counts["evaluated"] % 10 == 0:
             _heartbeat(connection, tenant_id, run_id)
         context = context_by_variant.get(variant_id, {})
-        history_days = int(len(group))
-        trailing_units = float((group.tail(14)["units_sold"] - group.tail(14)["returns_units"]).clip(lower=0).sum())
-        total_units = float((group["units_sold"] - group["returns_units"]).clip(lower=0).sum())
-        heuristic = _heuristic(group, context)
+        history_days, trailing_units, total_units = _eligibility_metrics(group, as_of_date)
+        heuristic = _heuristic(group, context, as_of_date)
         if not context.get("supplier_id"):
             counts["skipped"] += 1
             with connection.transaction():
@@ -327,7 +340,7 @@ def execute_run(connection: psycopg.Connection, tenant_id: str, run: dict[str, A
         stockouts = _stockout_dates(connection, tenant_id, store_id, variant_id, group["date"].min(), group["date"].max())
         try:
             result = evaluate_and_forecast_profile(
-                daily_series(group, stockouts),
+                daily_series(group, stockouts, end_date=as_of_date),
                 int(context.get("lead_time_days") or 7),
                 int(context.get("review_period_days") or REVIEW_PERIOD_DAYS),
             )

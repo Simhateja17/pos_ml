@@ -2,6 +2,8 @@ import os
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
 import manual_worker
 from job import _connect
 
@@ -44,6 +46,59 @@ class _Connection:
 
 
 class ManualWorkerTests(unittest.TestCase):
+    def test_eligibility_metrics_count_calendar_days_and_recent_calendar_window(self):
+        rows = pd.DataFrame(
+            {
+                "variant_id": ["variant"] * 3,
+                "date": ["2026-06-01", "2026-07-01", "2026-08-20"],
+                "units_sold": [20, 20, 5],
+                "returns_units": [0, 0, 1],
+            }
+        )
+
+        history_days, trailing_units, total_units = manual_worker._eligibility_metrics(
+            rows, "2026-08-26"
+        )
+
+        self.assertEqual(history_days, 81)
+        self.assertEqual(trailing_units, 4)
+        self.assertEqual(total_units, 44)
+
+    def test_eligibility_metrics_do_not_treat_old_active_rows_as_recent_days(self):
+        rows = pd.DataFrame(
+            {
+                "variant_id": ["variant"] * 2,
+                "date": ["2026-06-01", "2026-08-01"],
+                "units_sold": [30, 5],
+                "returns_units": [0, 0],
+            }
+        )
+
+        history_days, trailing_units, total_units = manual_worker._eligibility_metrics(
+            rows, "2026-08-26"
+        )
+
+        self.assertEqual(history_days, 62)
+        self.assertEqual(trailing_units, 0)
+        self.assertEqual(total_units, 35)
+
+    def test_heuristic_uses_calendar_history_and_recent_window(self):
+        rows = pd.DataFrame(
+            {
+                "variant_id": ["variant"] * 3,
+                "date": ["2026-06-01", "2026-07-01", "2026-08-20"],
+                "units_sold": [20, 20, 5],
+                "returns_units": [0, 0, 1],
+            }
+        )
+
+        result = manual_worker._heuristic(rows, {}, pd.Timestamp("2026-08-26"))
+
+        self.assertEqual(result["historyDays"], 81)
+        self.assertEqual(result["unitsSoldInWindow"], 5)
+        self.assertEqual(result["returnsInWindow"], 1)
+        self.assertEqual(result["netUnitsInWindow"], 4)
+
     def test_claim_uses_global_queue_rpc_without_tenant_parameter(self):
         row = {
             "run_id": "run",
