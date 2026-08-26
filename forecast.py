@@ -35,7 +35,9 @@ def daily_series(
     """Create one complete daily series and impute only ledger-proven stockouts."""
     frame = rows.copy()
     frame["date"] = pd.to_datetime(frame["date"])
-    frame["net_units"] = (frame["units_sold"] - frame["returns_units"]).clip(lower=0)
+    units_sold = pd.to_numeric(frame["units_sold"], errors="coerce").fillna(0.0)
+    returns_units = pd.to_numeric(frame["returns_units"], errors="coerce").fillna(0.0)
+    frame["net_units"] = (units_sold - returns_units).clip(lower=0).astype(float)
     observed_end = frame["date"].max()
     requested_end = pd.Timestamp(end_date) if end_date is not None else observed_end
     if requested_end.tzinfo is not None:

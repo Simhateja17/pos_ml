@@ -1,10 +1,12 @@
 import os
 import unittest
+from decimal import Decimal
 from unittest.mock import patch
 
 import pandas as pd
 
 import manual_worker
+from forecast import daily_series
 from job import _connect
 
 
@@ -98,6 +100,21 @@ class ManualWorkerTests(unittest.TestCase):
         self.assertEqual(result["unitsSoldInWindow"], 5)
         self.assertEqual(result["returnsInWindow"], 1)
         self.assertEqual(result["netUnitsInWindow"], 4)
+
+    def test_daily_series_coerces_database_numeric_values(self):
+        rows = pd.DataFrame(
+            {
+                "variant_id": ["variant", "variant"],
+                "date": ["2026-06-01", "2026-06-03"],
+                "units_sold": [Decimal("2.5"), Decimal("4")],
+                "returns_units": [Decimal("0"), Decimal("1")],
+            }
+        )
+
+        series = daily_series(rows, {pd.Timestamp("2026-06-02")})
+
+        self.assertEqual(series["y"].dtype.kind, "f")
+        self.assertEqual(len(series), 3)
 
     def test_claim_uses_global_queue_rpc_without_tenant_parameter(self):
         row = {
