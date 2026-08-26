@@ -34,14 +34,35 @@ jobs:
 
       - name: Pull latest ML code and reinstall (${{ matrix.region }})
         run: |
+          cat > remote-deploy.sh <<'REMOTE'
+          set -euo pipefail
+          cd "$HOME/Ambel_pos/ml"
+          git pull --ff-only origin main
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e .
+          REMOTE
+          # OS Login uses a service-account home on hosted runners. Initialise
+          # its SSH key first, then run the deployment as the VM's teja user,
+          # which owns /home/teja/Ambel_pos and the production virtualenv.
           gcloud compute ssh "${{ matrix.instance }}" \
             --zone="${{ matrix.zone }}" \
             --project="$GCP_PROJECT" \
             --tunnel-through-iap \
-            --command='
-              set -euo pipefail
-              cd "$HOME/Ambel_pos/ml"
-              git pull --ff-only origin main
-              .venv/bin/pip install --quiet --upgrade pip
-              .venv/bin/pip install --quiet -e .
-            '
+            --quiet \
+            --command=true </dev/null
+          gcloud compute ssh "${{ matrix.instance }}" \
+            --zone="${{ matrix.zone }}" \
+            --project="$GCP_PROJECT" \
+            --tunnel-through-iap \
+            --quiet \
+            --command='sudo -u teja -H bash -s' < remote-deploy.sh
+          deployed_sha="$(gcloud compute ssh "${{ matrix.instance }}" \
+            --zone="${{ matrix.zone }}" \
+            --project="$GCP_PROJECT" \
+            --tunnel-through-iap \
+            --quiet \
+            --command='sudo -u teja -H git -C /home/teja/Ambel_pos/ml rev-parse HEAD')"
+          if [[ "$deployed_sha" != "$GITHUB_SHA" ]]; then
+            echo "Expected deployed commit $GITHUB_SHA, found $deployed_sha" >&2
+            exit 1
+          fi
