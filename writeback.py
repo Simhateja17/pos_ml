@@ -6,7 +6,6 @@ than optional — a forecast written against the wrong shelf is worse than none.
 """
 from __future__ import annotations
 import json
-from math import ceil
 import psycopg
 from forecast import ForecastResult
 
@@ -15,13 +14,34 @@ def confidence(result: ForecastResult) -> str:
     return "high" if width <= .35 else "medium" if width <= .8 else "low"
 
 def upsert(connection: psycopg.Connection, tenant_id: str, store_id: str, variant_id: str, result: ForecastResult, context: dict) -> None:
-    safety = max(0, ceil(result.upper - result.demand))
-    raw = result.demand + safety - context["currentStock"] - context["onOrder"]
-    quantity = max(1, ceil(raw))
-    reason = {**context, "formula": "forecast_interval_reorder", "forecastDemand": result.demand,
-              "forecastLower": result.lower, "forecastUpper": result.upper, "model": result.model,
-              "forecastWape": result.wape, "heuristicWape": result.heuristic_wape,
-              "safetyStock": safety, "rawSuggestion": raw}
     with connection.cursor() as cur:
-        cur.execute("select public.ml_write_forecast_suggestion(%s::uuid,%s::uuid,%s::uuid,%s::numeric,%s::numeric,%s::numeric,%s::text,%s::numeric,%s::numeric,%s::integer,%s::integer,%s::integer,%s::integer,%s::integer,%s::numeric)",
-          (tenant_id,store_id,variant_id,result.demand,result.lower,result.upper,result.model,result.wape,result.heuristic_wape,context['historyDays'],context['windowDays'],context['unitsSoldInWindow'],context['returnsInWindow'],context['netUnitsInWindow'],context['dailyVelocity']))
+        cur.execute(
+            """
+            select public.ml_write_forecast_suggestion_v2(
+              %s::uuid,%s::uuid,%s::uuid,%s::numeric,%s::numeric,%s::numeric,
+              %s::numeric,%s::numeric,%s::numeric,%s::text,%s::numeric,%s::numeric,
+              %s::integer,%s::integer,%s::integer,%s::integer,%s::integer,%s::numeric,%s::integer
+            )
+            """,
+            (
+                tenant_id,
+                store_id,
+                variant_id,
+                result.demand,
+                result.lower,
+                result.upper,
+                result.lead_time_demand,
+                result.review_period_demand,
+                result.standard_14_demand,
+                result.model,
+                result.wape,
+                result.heuristic_wape,
+                context['historyDays'],
+                context['windowDays'],
+                context['unitsSoldInWindow'],
+                context['returnsInWindow'],
+                context['netUnitsInWindow'],
+                context['dailyVelocity'],
+                context['reviewPeriodDays'],
+            ),
+        )

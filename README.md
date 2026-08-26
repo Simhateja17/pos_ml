@@ -36,6 +36,19 @@ ML_TENANT_ID='tenant-uuid' \
 .venv/bin/couture-forecast
 ```
 
+The temporary manual-test queue uses the same restricted connection through a
+separate, one-shot worker. It claims one queued run across all tenants through
+a narrow database adapter, then sets the returned tenant as its RLS context:
+
+```sh
+ML_DATABASE_URL='postgresql://...' \
+.venv/bin/couture-forecast-worker
+```
+
+The worker records a side-by-side heuristic/ML comparison and writes only
+genuine winning forecast suggestions to `reorder_suggestions`. It has no HTTP
+surface. On the GCP VM it is invoked by `Ambel-ml-manual-worker.timer`.
+
 Task 1's command is intentionally only a preflight. It imports the pinned
 forecasting stack, sets the tenant RLS context, reads the tenant's rollup, and
 fails closed if the connected role has any table privilege outside the two-table

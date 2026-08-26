@@ -20,7 +20,7 @@ import psycopg
 import statsforecast
 from psycopg.rows import dict_row
 from eligibility import assess
-from forecast import daily_series, evaluate_and_forecast
+from forecast import daily_series, evaluate_and_forecast_profile
 from writeback import upsert
 
 
@@ -56,6 +56,17 @@ def _psycopg_url(database_url: str) -> str:
         if key != "pgbouncer"
     ])
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
+def _connect(database_url: str) -> psycopg.Connection:
+    """Open a connection compatible with Supavisor transaction pooling.
+
+    The ML role uses the transaction-mode pooler on port 6543.  Automatic
+    server-side prepared statements are connection/backend-specific there and
+    can collide when a transaction is assigned to another backend.
+    """
+
+    return psycopg.connect(database_url, prepare_threshold=None)
 
 
 def _assert_least_privilege(connection: psycopg.Connection) -> None:
@@ -95,7 +106,7 @@ def _assert_least_privilege(connection: psycopg.Connection) -> None:
 def inspect_rollup(settings: Settings) -> dict[str, object]:
     """Read one tenant's rollup and prove the connection role is constrained."""
 
-    with psycopg.connect(settings.database_url) as connection:
+    with _connect(settings.database_url) as connection:
         with connection.transaction():
             with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute("select set_config('app.tenant_id', %s, true)", (str(settings.tenant_id),))
@@ -123,7 +134,7 @@ def main() -> int:
     try:
         settings = Settings.from_environment()
         summary = inspect_rollup(settings)
-        with psycopg.connect(settings.database_url) as connection, connection.transaction():
+        with _connect(settings.database_url) as connection, connection.transaction():
             with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute("select set_config('app.tenant_id', %s, true)", (str(settings.tenant_id),))
                 # Phase 8: the rollup is keyed (tenant, STORE, variant, date). Grouping
@@ -142,14 +153,55 @@ def main() -> int:
                     print(json.dumps(summary, default=str, sort_keys=True))
                     return 0
                 for (store_id, variant_id), group in rows.groupby(['store_id', 'variant_id']):
-                    history = len(group); trailing = int((group.tail(14).units_sold-group.tail(14).returns_units).clip(lower=0).sum()); total = int((group.units_sold-group.returns_units).clip(lower=0).sum())
-                    if not assess(history,trailing,total).eligible: continue
-                    cursor.execute('select stockout_date from public.ml_stockout_dates(%s,%s,%s,%s,%s)',(str(settings.tenant_id),str(store_id),str(variant_id),group.date.min(),group.date.max()))
-                    stockouts={pd.Timestamp(r['stockout_date']) for r in cursor.fetchall()}
-                    try: result=evaluate_and_forecast(daily_series(group,stockouts),14)
-                    except ValueError: continue
-                    context={'supplierId':None,'currentStock':0,'onOrder':0,'windowDays':30,'historyDays':history,'unitsSoldInWindow':int(group.tail(30).units_sold.sum()),'returnsInWindow':int(group.tail(30).returns_units.sum()),'netUnitsInWindow':int((group.tail(30).units_sold-group.tail(30).returns_units).sum()),'dailyVelocity':float(group.tail(30).units_sold.mean()),'leadTimeDays':0,'leadTimeDemand':0,'safetyDays':0,'safetyStock':0,'reorderPoint':0,'reviewPeriodDays':0,'reviewPeriodDemand':0,'supplierName':None}
-                    upsert(connection,str(settings.tenant_id),str(store_id),str(variant_id),result,context); written+=1
+                    history = len(group)
+                    recent = group.tail(30)
+                    trailing = int((group.tail(14).units_sold - group.tail(14).returns_units).clip(lower=0).sum())
+                    total = int((group.units_sold - group.returns_units).clip(lower=0).sum())
+                    if not assess(history, trailing, total).eligible:
+                        continue
+                    cursor.execute(
+                        'select * from public.ml_forecast_variant_context(%s::uuid,%s::uuid,%s::uuid)',
+                        (str(settings.tenant_id), str(store_id), str(variant_id)),
+                    )
+                    db_context = cursor.fetchone()
+                    if not db_context or db_context['supplier_id'] is None:
+                        continue
+                    cursor.execute(
+                        'select stockout_date from public.ml_stockout_dates(%s,%s,%s,%s,%s)',
+                        (str(settings.tenant_id), str(store_id), str(variant_id), group.date.min(), group.date.max()),
+                    )
+                    stockouts = {pd.Timestamp(r['stockout_date']) for r in cursor.fetchall()}
+                    try:
+                        result = evaluate_and_forecast_profile(
+                            daily_series(group, stockouts),
+                            int(db_context['lead_time_days'] or 7),
+                            7,
+                        )
+                    except ValueError:
+                        continue
+                    recent_net = (recent.units_sold - recent.returns_units).clip(lower=0)
+                    effective_days = max(1, min(history, 30))
+                    context = {
+                        'supplierId': str(db_context['supplier_id']),
+                        'currentStock': int(db_context['current_stock'] or 0),
+                        'onOrder': int(db_context['on_order'] or 0),
+                        'windowDays': 30,
+                        'historyDays': history,
+                        'unitsSoldInWindow': int(recent.units_sold.sum()),
+                        'returnsInWindow': int(recent.returns_units.sum()),
+                        'netUnitsInWindow': int(recent_net.sum()),
+                        'dailyVelocity': float(recent_net.sum()) / effective_days,
+                        'leadTimeDays': int(db_context['lead_time_days'] or 7),
+                        'leadTimeDemand': result.lead_time_demand,
+                        'safetyDays': 7,
+                        'safetyStock': max(0, result.upper - result.demand),
+                        'reorderPoint': result.lead_time_demand + max(0, result.upper - result.demand),
+                        'reviewPeriodDays': 7,
+                        'reviewPeriodDemand': result.review_period_demand,
+                        'supplierName': db_context['supplier_name'],
+                    }
+                    upsert(connection, str(settings.tenant_id), str(store_id), str(variant_id), result, context)
+                    written += 1
                 summary['forecast_rows_written']=written
     except (ValueError, PermissionError, psycopg.Error) as error:
         print(f"forecast job preflight failed: {error}", file=sys.stderr)

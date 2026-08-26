@@ -21,6 +21,10 @@ class ForecastResult:
     upper: float
     wape: float
     heuristic_wape: float
+    standard_14_demand: float = 0.0
+    lead_time_demand: float = 0.0
+    review_period_demand: float = 0.0
+    horizon_days: int = 14
 
 
 def daily_series(rows: pd.DataFrame, stockout_dates: set[pd.Timestamp]) -> pd.DataFrame:
@@ -74,4 +78,49 @@ def evaluate_and_forecast(series: pd.DataFrame, horizon: int) -> ForecastResult:
     lower_column, upper_column = f"{model}-lo-80", f"{model}-hi-80"
     lower = max(0.0, float(future[lower_column].sum()))
     upper = max(demand, float(future[upper_column].sum()))
-    return ForecastResult(model=model, demand=demand, lower=lower, upper=upper, wape=wape, heuristic_wape=heuristic_wape)
+    standard = max(0.0, float(future[model].head(14).sum()))
+    return ForecastResult(
+        model=model, demand=demand, lower=lower, upper=upper,
+        wape=wape, heuristic_wape=heuristic_wape,
+        standard_14_demand=standard, horizon_days=horizon,
+    )
+
+
+def evaluate_and_forecast_profile(
+    series: pd.DataFrame,
+    lead_time_days: int,
+    review_period_days: int = 7,
+) -> ForecastResult:
+    """Evaluate the model once and retain operational and standard horizons.
+
+    The model is selected using the same held-out WAPE gate as the nightly
+    job. The future frame is long enough to split the operational horizon into
+    supplier lead-time demand and the review buffer, while the first 14 days
+    remain available as a stable comparison metric for the test UI.
+    """
+
+    horizon = max(1, int(lead_time_days) + int(review_period_days))
+    # Reuse the existing evaluator for the quality gate and model choice. It
+    # also produces the exact operational aggregate, avoiding two subtly
+    # different selection paths.
+    base = evaluate_and_forecast(series, horizon)
+    future = _forecast(series, max(14, horizon))
+    lower_column, upper_column = f"{base.model}-lo-80", f"{base.model}-hi-80"
+    operational = future.head(horizon)
+    demand = max(0.0, float(operational[base.model].sum()))
+    lower = max(0.0, float(operational[lower_column].sum()))
+    upper = max(demand, float(operational[upper_column].sum()))
+    lead = future.head(max(0, int(lead_time_days)))
+    review = future.iloc[max(0, int(lead_time_days)):horizon]
+    return ForecastResult(
+        model=base.model,
+        demand=demand,
+        lower=lower,
+        upper=upper,
+        wape=base.wape,
+        heuristic_wape=base.heuristic_wape,
+        standard_14_demand=max(0.0, float(future.head(14)[base.model].sum())),
+        lead_time_demand=max(0.0, float(lead[base.model].sum())),
+        review_period_demand=max(0.0, float(review[base.model].sum())),
+        horizon_days=horizon,
+    )

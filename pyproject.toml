@@ -19,6 +19,7 @@ StatsForecast = "https://github.com/Nixtla/statsforecast"
 
 [project.scripts]
 couture-forecast = "job:main"
+couture-forecast-worker = "manual_worker:main"
 
 [tool.setuptools]
-py-modules = ["job"]
+py-modules = ["job", "eligibility", "forecast", "writeback", "manual_worker"]
