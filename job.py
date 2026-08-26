@@ -153,6 +153,7 @@ def main() -> int:
                     print(json.dumps(summary, default=str, sort_keys=True))
                     return 0
                 as_of_date = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
+                generated_at = pd.Timestamp.now(tz="UTC").to_pydatetime()
                 for (store_id, variant_id), group in rows.groupby(['store_id', 'variant_id']):
                     history, trailing_float, total_float = calendar_metrics(group, as_of_date)
                     trailing = int(trailing_float)
@@ -202,7 +203,7 @@ def main() -> int:
                         'reviewPeriodDemand': result.review_period_demand,
                         'supplierName': db_context['supplier_name'],
                     }
-                    upsert(connection, str(settings.tenant_id), str(store_id), str(variant_id), result, context)
+                    upsert(connection, str(settings.tenant_id), str(store_id), str(variant_id), result, context, generated_at)
                     written += 1
                 summary['forecast_rows_written']=written
     except (ValueError, PermissionError, psycopg.Error) as error:

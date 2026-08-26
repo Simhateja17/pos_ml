@@ -6,6 +6,7 @@ than optional — a forecast written against the wrong shelf is worse than none.
 """
 from __future__ import annotations
 import json
+from datetime import datetime
 import psycopg
 from forecast import ForecastResult
 
@@ -13,14 +14,23 @@ def confidence(result: ForecastResult) -> str:
     width = (result.upper - result.lower) / max(result.demand, 1)
     return "high" if width <= .35 else "medium" if width <= .8 else "low"
 
-def upsert(connection: psycopg.Connection, tenant_id: str, store_id: str, variant_id: str, result: ForecastResult, context: dict) -> None:
+def upsert(
+    connection: psycopg.Connection,
+    tenant_id: str,
+    store_id: str,
+    variant_id: str,
+    result: ForecastResult,
+    context: dict,
+    generated_at: datetime | None = None,
+) -> None:
     with connection.cursor() as cur:
         cur.execute(
             """
-            select public.ml_write_forecast_suggestion_v2(
+            select public.ml_write_forecast_suggestion_v3(
               %s::uuid,%s::uuid,%s::uuid,%s::numeric,%s::numeric,%s::numeric,
               %s::numeric,%s::numeric,%s::numeric,%s::text,%s::numeric,%s::numeric,
-              %s::integer,%s::integer,%s::integer,%s::integer,%s::integer,%s::numeric,%s::integer
+              %s::integer,%s::integer,%s::integer,%s::integer,%s::integer,
+              %s::numeric,%s::integer,%s::timestamptz
             )
             """,
             (
@@ -43,5 +53,6 @@ def upsert(connection: psycopg.Connection, tenant_id: str, store_id: str, varian
                 context['netUnitsInWindow'],
                 context['dailyVelocity'],
                 context['reviewPeriodDays'],
+                generated_at,
             ),
         )

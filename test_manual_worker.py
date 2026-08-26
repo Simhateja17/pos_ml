@@ -1,6 +1,8 @@
 import os
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -152,6 +154,43 @@ class ManualWorkerTests(unittest.TestCase):
             "postgresql://user:password@example.test:6543/postgres",
             prepare_threshold=None,
         )
+
+    def test_forecast_write_uses_explicit_batch_timestamp(self):
+        connection = _Connection(None)
+        generated_at = datetime(2026, 8, 26, 12, 33, 0, tzinfo=timezone.utc)
+        result = SimpleNamespace(
+            demand=7.0,
+            lower=2.0,
+            upper=12.0,
+            lead_time_demand=3.0,
+            review_period_demand=2.0,
+            standard_14_demand=4.0,
+            model="AutoETS",
+            wape=0.2,
+            heuristic_wape=0.3,
+        )
+        heuristic = {
+            "historyDays": 60,
+            "unitsSoldInWindow": 20,
+            "returnsInWindow": 1,
+            "netUnitsInWindow": 19,
+            "dailyVelocity": 0.63,
+        }
+
+        manual_worker._write_forecast_suggestion(
+            connection,
+            "tenant",
+            "store",
+            "variant",
+            result,
+            heuristic,
+            {"review_period_days": 7},
+            generated_at,
+        )
+
+        self.assertIn("ml_write_forecast_suggestion_v3", connection.cursor_instance.query)
+        self.assertEqual(len(connection.cursor_instance.params), 20)
+        self.assertEqual(connection.cursor_instance.params[-1], generated_at)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from math import ceil
 from typing import Any
 
@@ -220,15 +221,16 @@ def _write_forecast_suggestion(
     result: Any,
     heuristic: dict[str, Any],
     context: dict[str, Any],
+    generated_at: datetime,
 ) -> None:
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            select public.ml_write_forecast_suggestion_v2(
+            select public.ml_write_forecast_suggestion_v3(
               %s::uuid,%s::uuid,%s::uuid,%s::numeric,%s::numeric,%s::numeric,
               %s::numeric,%s::numeric,%s::numeric,%s::text,%s::numeric,%s::numeric,
               %s::integer,%s::integer,%s::integer,%s::integer,%s::integer,
-              %s::numeric,%s::integer
+              %s::numeric,%s::integer,%s::timestamptz
             )
             """,
             (
@@ -251,6 +253,7 @@ def _write_forecast_suggestion(
                 int(heuristic["netUnitsInWindow"]),
                 heuristic["dailyVelocity"],
                 int(context.get("review_period_days") or REVIEW_PERIOD_DAYS),
+                generated_at,
             ),
         )
 
@@ -312,6 +315,11 @@ def execute_run(connection: psycopg.Connection, tenant_id: str, run: dict[str, A
     contexts = _context(connection, tenant_id, run_id)
     context_by_variant = {str(row["variant_id"]): row for row in contexts}
     counts = {"evaluated": 0, "eligible": 0, "won": 0, "written": 0, "skipped": 0}
+    # Every forecast suggestion from one run must carry the same generation
+    # timestamp. Each item is deliberately committed in its own short
+    # transaction, so the database function cannot rely on transaction-local
+    # now() to identify the logical batch.
+    generated_at = pd.Timestamp.now(tz="UTC").to_pydatetime()
 
     for variant_id, group in rows.groupby("variant_id") if not rows.empty else []:
         variant_id = str(variant_id)
@@ -373,7 +381,7 @@ def execute_run(connection: psycopg.Connection, tenant_id: str, run: dict[str, A
         with connection.transaction():
             _set_tenant(connection, tenant_id)
             if ml_quantity > 0:
-                _write_forecast_suggestion(connection, tenant_id, store_id, variant_id, result, heuristic, context)
+                _write_forecast_suggestion(connection, tenant_id, store_id, variant_id, result, heuristic, context, generated_at)
                 counts["written"] += 1
             counts["won"] += 1
             _write_item(connection, tenant_id, run_id, store_id, variant_id, history_days, trailing_units, total_units, True, context, heuristic, ml_result, disposition, None)
